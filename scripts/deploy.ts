@@ -47,24 +47,11 @@ async function deployContracts() {
   const [deployer] = await ethers.getSigners();
   console.log("Deploying contracts with account:", deployer.address);
 
-  const TokenContract = await ethers.getContractFactory("TokenContract");
-  const tokenContract = await upgrades.deployProxy(
-    TokenContract,
-    ["Equity Token", "EQT"],
-    { 
-      initializer: "initialize",
-      kind: "transparent"
-    }
-  );
-  await tokenContract.waitForDeployment();
-  const tokenAddress = await tokenContract.getAddress();
-  console.log("Token Contract deployed to:", tokenAddress);
-
   const AccessControlContract = await ethers.getContractFactory("AccessControlContract");
   const accessControlContract = await upgrades.deployProxy(
     AccessControlContract,
     [],
-    { 
+    {
       initializer: "initialize",
       kind: "transparent"
     }
@@ -72,6 +59,19 @@ async function deployContracts() {
   await accessControlContract.waitForDeployment();
   const accessControlAddress = await accessControlContract.getAddress();
   console.log("Access Control Contract deployed to:", accessControlAddress);
+  
+  const TokenContract = await ethers.getContractFactory("TokenContract");
+  const tokenContract = await upgrades.deployProxy(
+    TokenContract,
+    ["Equity Token", "EQT", accessControlAddress],
+    {
+      initializer: "initialize",
+      kind: "transparent"
+    }
+  );
+  await tokenContract.waitForDeployment();
+  const tokenAddress = await tokenContract.getAddress();
+  console.log("Token Contract deployed to:", tokenAddress);
 
   const VestingContract = await ethers.getContractFactory("VestingContract");
   const vestingContract = await upgrades.deployProxy(
@@ -100,14 +100,15 @@ async function deployContracts() {
 }
 
 async function setupContracts(
+  accessControlContract: any,
   tokenContract: any, 
   vestingContract: any, 
   vestingAddress: string
 ) {
   console.log("Setting up contract permissions and initial configuration...");
 
-  const minterRole = ethers.id("MINTER_ROLE");
-  await tokenContract.grantRole(minterRole, vestingAddress);
+  const minterRole = ethers.encodeBytes32String("MINTER_ROLE");
+  await accessControlContract.grantRole(minterRole, vestingAddress);
   console.log("Granted MINTER_ROLE to VestingContract");
 
   for (const equityClass of DEFAULT_EQUITY_CLASSES) {
@@ -259,9 +260,9 @@ async function main() {
   ]);
 
   if (action === "Deploy 🚀") {
-    const { tokenContract, vestingContract, addresses } = await deployContracts();
+    const { tokenContract, vestingContract, accessControlContract, addresses } = await deployContracts();
 
-    await setupContracts(tokenContract, vestingContract, addresses.vesting);
+    await setupContracts(accessControlContract, tokenContract, vestingContract, addresses.vesting);
 
     const deploymentData: DeploymentData = {
       tokenContract: addresses.token,
