@@ -2,30 +2,29 @@
 pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "./AccessControlContract.sol";
 
 contract TokenContract is 
     Initializable,
-    ERC20Upgradeable,
-    AccessControlUpgradeable 
+    ERC20Upgradeable
 {
-    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+    AccessControlContract private accessControl;
 
     function initialize(
         string memory name,
-        string memory symbol
+        string memory symbol,
+        address accessControlAddress
     ) public initializer {
         __ERC20_init(name, symbol);
-        __AccessControl_init();
-        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _grantRole(MINTER_ROLE, msg.sender);
+        accessControl = AccessControlContract(accessControlAddress);
     }
 
     function mint(
         address to,
         uint256 amount
-    ) public onlyRole(MINTER_ROLE) {
+    ) public {
+        require(accessControl.isMinter(msg.sender), "Only minter can mint tokens");
         _mint(to, amount);
     }
 }

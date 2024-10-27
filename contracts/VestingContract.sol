@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
@@ -21,26 +20,26 @@ contract VestingContract is
     }
 
     struct EmployeeEquity {
+        address employee;
         bytes32 equityClass;
         uint96 totalTokens;
         uint40 startTime;
+        uint96 claimedTokens;
     }
 
     /// @custom:oz-upgrades-unsafe-allow state-variable-immutable
     TokenContract public immutable token;
+
     /// @custom:oz-upgrades-unsafe-allow state-variable-immutable
     AccessControlContract public immutable accessControl;
     
     mapping(bytes32 => EquityClass) private equityClasses;        
     mapping(address => EmployeeEquity) private employeeEquities;      
-    mapping(address => uint96) private claimedTokens;     
+    mapping(address => uint96) private totalReleasedTokens;
     
-    address[] private employeeAddresses;
+    mapping(bytes32 => uint256) private equityClassIndex;
     bytes32[] private equityClassNames;                       
 
-    bytes32 public constant DEFAULT_ADMIN_ROLE = 0x00;
-    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
-    bytes32 public constant GRANTER_ROLE = keccak256("GRANTER_ROLE");
     uint16 public constant BASIS_POINTS = 10000;
 
     uint256[49] private __gap;
@@ -49,7 +48,6 @@ contract VestingContract is
     event EquityGranted(address indexed employee, bytes32 indexed equityClassName, uint40 grantTime);
     event TokensClaimed(address indexed employee, uint96 amount);
 
-    error NotAuthorized(bytes32 role);
     error InvalidEquityClass(string reason);
     error NoEquityGranted(address employee);
     error NoTokensToClaim(address employee);
@@ -57,13 +55,6 @@ contract VestingContract is
     error CliffPeriodNotMet(uint256 remainingTime);
     error ZeroAddress();
     error InvalidVestingParameters();
-
-    modifier onlyRole(bytes32 role) {
-        if (!accessControl.hasRole(role, msg.sender)) {
-            revert NotAuthorized(role);
-        }
-        _;
-    }
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor(
@@ -74,6 +65,16 @@ contract VestingContract is
         token = TokenContract(tokenAddress);
         accessControl = AccessControlContract(accessControlAddress);
         _disableInitializers();
+    }
+
+    modifier onlyAdmin() {
+        require(accessControl.isAdmin(msg.sender), "Only admin can perform this action");
+        _;
+    }
+
+    modifier onlyGranter() {
+        require(accessControl.isGranter(msg.sender), "Only granter can perform this action");
+        _;
     }
 
     // write functions
@@ -89,7 +90,7 @@ contract VestingContract is
         uint32 cliffPeriod,
         uint32 vestingPeriod,
         uint16 vestingPercentage
-    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    ) external onlyAdmin {
         if (vestingPercentage > 100) revert InvalidEquityClass("Percentage exceeds 100%");
         if (vestingPercentage == 0) revert InvalidEquityClass("Percentage cannot be zero");
         if (tokenCount == 0) revert InvalidEquityClass("Token count cannot be zero");
@@ -103,7 +104,11 @@ contract VestingContract is
             vestingPeriod: vestingPeriod,
             vestingPercentage: vestingPercentageBP
         });
-        equityClassNames.push(name);
+        
+        if (equityClassIndex[name] == 0) {
+            equityClassNames.push(name);
+            equityClassIndex[name] = equityClassNames.length;
+        }
         
         emit EquityClassDefined(name, tokenCount);
     }
@@ -111,79 +116,79 @@ contract VestingContract is
     function grantEquity(
         address employee,
         bytes32 equityClassName
-    ) external onlyRole(GRANTER_ROLE) {
+    ) external onlyGranter {
         if (employee == address(0)) revert ZeroAddress();
         
-        EquityClass memory eqClass = equityClasses[equityClassName];
-        if (eqClass.tokenCount == 0) revert InvalidEquityClass("Equity class does not exist");
+        EquityClass storage equityClass = equityClasses[equityClassName];
+        if (equityClass.tokenCount == 0) revert InvalidEquityClass("Equity class does not exist");
         if (employeeEquities[employee].equityClass != bytes32(0)) revert InvalidEquityClass("Employee already has equity granted");
         
         employeeEquities[employee] = EmployeeEquity({
+            employee: employee,
             equityClass: equityClassName,
-            totalTokens: eqClass.tokenCount,
-            startTime: uint40(block.timestamp)
+            totalTokens: equityClass.tokenCount,
+            startTime: uint40(block.timestamp),
+            claimedTokens: 0
         });
-        employeeAddresses.push(employee);
         
         emit EquityGranted(employee, equityClassName, uint40(block.timestamp));
     }
 
     function calculateVestedTokens(address employee) public view returns (uint256) {
-        EmployeeEquity memory equity = employeeEquities[employee];
+        EmployeeEquity storage equity = employeeEquities[employee];
         if (equity.equityClass == bytes32(0)) {
             return 0;
         }
 
-        EquityClass memory eqClass = equityClasses[equity.equityClass];
+        EquityClass storage equityClass = equityClasses[equity.equityClass];
         uint256 elapsedTime = block.timestamp - equity.startTime;
 
         // check if cliff period has passed
-        if (elapsedTime < eqClass.cliffPeriod) {
+        if (elapsedTime < equityClass.cliffPeriod) {
             return 0;
         }
 
         // calculate number of complete vesting periods
-        uint256 vestingTime = elapsedTime - eqClass.cliffPeriod;
-        uint256 completedPeriods = vestingTime / eqClass.vestingPeriod;
+        uint256 vestingTime = elapsedTime - equityClass.cliffPeriod;
+        uint256 completedPeriods = vestingTime / equityClass.vestingPeriod;
         
         // calculate vested percentage including cliff and completed periods
-        uint256 vestedPercentage = eqClass.vestingPercentage + (completedPeriods * eqClass.vestingPercentage);
+        uint256 vestedPercentage = equityClass.vestingPercentage + (completedPeriods * equityClass.vestingPercentage);
         if (vestedPercentage > BASIS_POINTS) {
             vestedPercentage = BASIS_POINTS;
         }
 
         // calculate total vested tokens
-        uint256 alreadyClaimed = claimedTokens[employee];
         uint256 totalVestedAmount = (equity.totalTokens * vestedPercentage) / BASIS_POINTS;
         
         // if already claimed more than currently vested, return 0
-        if (alreadyClaimed >= totalVestedAmount) {
+        if (equity.claimedTokens >= totalVestedAmount) {
             return 0;
         }
         
-        return totalVestedAmount - alreadyClaimed;
+        return totalVestedAmount - equity.claimedTokens;
     }
 
     function getNextVestingAmount(address employee) external view returns (uint256 amount, uint256 unlockTime) {
-        EmployeeEquity memory equity = employeeEquities[employee];
+        EmployeeEquity storage equity = employeeEquities[employee];
         if (equity.equityClass == bytes32(0)) {
             return (0, 0);
         }
 
-        EquityClass memory eqClass = equityClasses[equity.equityClass];
+        EquityClass storage equityClass = equityClasses[equity.equityClass];
         uint256 elapsedTime = block.timestamp - equity.startTime;
 
         // if cliff period hasn't passed yet
-        if (elapsedTime < eqClass.cliffPeriod) {
+        if (elapsedTime < equityClass.cliffPeriod) {
             // first batch after cliff
-            uint256 firstBatch = (equity.totalTokens * eqClass.vestingPercentage) / BASIS_POINTS;
-            return (firstBatch, equity.startTime + eqClass.cliffPeriod);
+            uint256 firstBatch = (equity.totalTokens * equityClass.vestingPercentage) / BASIS_POINTS;
+            return (firstBatch, equity.startTime + equityClass.cliffPeriod);
         }
 
         // calculate current and next vesting milestones
-        uint256 vestingTime = elapsedTime - eqClass.cliffPeriod;
-        uint256 currentPeriods = 1 + (vestingTime / eqClass.vestingPeriod);
-        uint256 totalVestedPercentage = currentPeriods * eqClass.vestingPercentage;
+        uint256 vestingTime = elapsedTime - equityClass.cliffPeriod;
+        uint256 currentPeriods = 1 + (vestingTime / equityClass.vestingPeriod);
+        uint256 totalVestedPercentage = currentPeriods * equityClass.vestingPercentage;
 
         // if fully vested
         if (totalVestedPercentage >= BASIS_POINTS) {
@@ -191,29 +196,32 @@ contract VestingContract is
         }
 
         // calculate next batch
-        uint256 batchAmount = (equity.totalTokens * eqClass.vestingPercentage) / BASIS_POINTS;
-        uint256 nextUnlockTime = equity.startTime + eqClass.cliffPeriod + (currentPeriods * eqClass.vestingPeriod);
+        uint256 batchAmount = (equity.totalTokens * equityClass.vestingPercentage) / BASIS_POINTS;
+        uint256 nextUnlockTime = equity.startTime + equityClass.cliffPeriod + (currentPeriods * equityClass.vestingPeriod);
 
         return (batchAmount, nextUnlockTime);
     }
 
     function claimVestedTokens() external nonReentrant {
-        EmployeeEquity memory equity = employeeEquities[msg.sender];
+        EmployeeEquity storage equity = employeeEquities[msg.sender];
         if (equity.equityClass == bytes32(0)) revert NoEquityGranted(msg.sender);
         
-        EquityClass memory eqClass = equityClasses[equity.equityClass];
+        EquityClass storage equityClass = equityClasses[equity.equityClass];
         uint256 elapsedTime = block.timestamp - equity.startTime;
         
         // enforce cliff period
-        if (elapsedTime < eqClass.cliffPeriod) {
-            revert CliffPeriodNotMet(eqClass.cliffPeriod - elapsedTime);
+        if (elapsedTime < equityClass.cliffPeriod) {
+            revert CliffPeriodNotMet(equityClass.cliffPeriod - elapsedTime);
         }
         
         uint256 unclaimedTokens = calculateVestedTokens(msg.sender);
         if (unclaimedTokens == 0) revert NoTokensToClaim(msg.sender);
 
         // update claimed tokens
-        claimedTokens[msg.sender] += uint96(unclaimedTokens);
+        unchecked {
+            equity.claimedTokens += uint96(unclaimedTokens);
+            totalReleasedTokens[msg.sender] += uint96(unclaimedTokens);
+        }
         
         // transfer tokens
         bool success = token.transfer(msg.sender, unclaimedTokens);
@@ -233,10 +241,6 @@ contract VestingContract is
 
     // read functions
 
-    function getEmployeeAddresses() external view onlyRole(DEFAULT_ADMIN_ROLE) returns (address[] memory) {
-        return employeeAddresses;
-    }
-
     function getEquityClassNames() external view returns (bytes32[] memory) {
         return equityClassNames;
     }
@@ -244,12 +248,12 @@ contract VestingContract is
     function getEquityClassDetails(
         bytes32 name
     ) external view returns (uint96, uint32, uint32, uint16) {
-        EquityClass memory eqClass = equityClasses[name];
+        EquityClass storage equityClass = equityClasses[name];
         return (
-            eqClass.tokenCount,
-            eqClass.cliffPeriod,
-            eqClass.vestingPeriod,
-            eqClass.vestingPercentage
+            equityClass.tokenCount,
+            equityClass.cliffPeriod,
+            equityClass.vestingPeriod,
+            equityClass.vestingPercentage
         );
     }
 
@@ -258,27 +262,33 @@ contract VestingContract is
     }
 
     function getTotalTokensLockedForEmployees() external view returns (uint96) {
-        uint256 length = employeeAddresses.length;
         uint96 totalLocked;
-        for (uint256 i = 0; i < length;) {
-            totalLocked += employeeEquities[employeeAddresses[i]].totalTokens;
+        for (uint256 i = 0; i < equityClassNames.length;) {
+            bytes32 className = equityClassNames[i];
+            totalLocked += equityClasses[className].tokenCount;
             unchecked { ++i; }
         }
         return totalLocked;
     }
 
     function getTotalTokensReleasedToEmployees() external view returns (uint96) {
-        uint256 length = employeeAddresses.length;
         uint96 totalReleased;
-        for (uint256 i = 0; i < length;) {
-            totalReleased += claimedTokens[employeeAddresses[i]];
-            unchecked { ++i; }
+        for (uint256 i = 0; i < equityClassNames.length;) {
+            bytes32 className = equityClassNames[i];
+            EquityClass storage equityClass = equityClasses[className];
+            unchecked {
+                for (uint256 j = 0; j < equityClass.tokenCount;) {
+                    totalReleased += totalReleasedTokens[employeeEquities[msg.sender].employee];
+                    ++j;
+                }
+                ++i;
+            }
         }
         return totalReleased;
     }
 
     function getClaimedTokens(address employee) external view returns (uint96) {
-        return claimedTokens[employee];
+        return employeeEquities[employee].claimedTokens;
     }
 
     function getEmployeeEquityClass(address employee) external view returns (bytes32) {
